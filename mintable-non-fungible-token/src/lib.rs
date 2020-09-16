@@ -3,12 +3,131 @@
 #![deny(warnings)]
 
 use borsh::{BorshDeserialize, BorshSerialize};
-use near_sdk::collections::UnorderedMap;
-use near_sdk::collections::UnorderedSet;
-use near_sdk::{env, near_bindgen, AccountId};
+use near_sdk::collections::{UnorderedMap, UnorderedSet};
+use near_sdk::{env, near_bindgen, AccountId, ext_contract};
+use near_sdk::json_types::U128;
 
 #[global_allocator]
 static ALLOC: wee_alloc::WeeAlloc = wee_alloc::WeeAlloc::INIT;
+
+/// Data that was emitted by the Ethereum event.
+pub struct EthEventData {
+    pub locker_address: [u8; 20],
+    pub token: String,
+    pub sender: String,
+    pub token_id: u128,
+    pub recipient: AccountId,
+}
+
+impl EthEventData {
+    /// Parse raw log entry data.
+    pub fn from_log_entry_data(data: &[u8]) -> Self {
+        use eth_types::*;
+        use ethabi::{Event, EventParam, Hash, ParamType, RawLog};
+        use hex::ToHex;
+
+        let event = Event {
+            name: "Locked".to_string(),
+            inputs: vec![
+                EventParam {
+                    name: "token".to_string(),
+                    kind: ParamType::Address,
+                    indexed: true,
+                },
+                EventParam {
+                    name: "sender".to_string(),
+                    kind: ParamType::Address,
+                    indexed: true,
+                },
+                EventParam {
+                    name: "amount".to_string(),
+                    kind: ParamType::Uint(256),
+                    indexed: false,
+                },
+                EventParam {
+                    name: "accountId".to_string(),
+                    kind: ParamType::String,
+                    indexed: false,
+                },
+            ],
+            anonymous: false,
+        };
+
+        let log_entry: LogEntry = rlp::decode(data).unwrap();
+        let locker_address = (log_entry.address.clone().0).0;
+        let raw_log = RawLog {
+            topics: log_entry
+                .topics
+                .iter()
+                .map(|h| Hash::from(&((h.0).0)))
+                .collect(),
+            data: log_entry.data.clone(),
+        };
+        let log = event.parse_log(raw_log).unwrap();
+        let token = log.params[0].value.clone().to_address().unwrap().0;
+        let token = (&token).encode_hex::<String>();
+        let sender = log.params[1].value.clone().to_address().unwrap().0;
+        let sender = (&sender).encode_hex::<String>();
+        let token_id = log.params[2].value.clone().to_uint().unwrap().as_u128();
+        let recipient = log.params[3].value.clone().to_string().unwrap();
+        Self {
+            locker_address,
+            token,
+            sender,
+            token_id,
+            recipient,
+        }
+    }
+}
+
+impl std::fmt::Display for EthEventData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "token: {}; sender: {}; token_id: {}; recipient: {}",
+            self.token, self.sender, self.token_id, self.recipient
+        )
+    }
+}
+
+#[ext_contract(prover)]
+pub trait Prover {
+    #[result_serializer(borsh)]
+    fn verify_log_entry(
+        &self,
+        #[serializer(borsh)] log_index: u64,
+        #[serializer(borsh)] log_entry_data: Vec<u8>,
+        #[serializer(borsh)] receipt_index: u64,
+        #[serializer(borsh)] receipt_data: Vec<u8>,
+        #[serializer(borsh)] header_data: Vec<u8>,
+        #[serializer(borsh)] proof: Vec<Vec<u8>>,
+        #[serializer(borsh)] skip_bridge_call: bool,
+    ) -> bool;
+}
+
+#[cfg(not(test))]
+#[derive(BorshDeserialize, BorshSerialize, Clone)]
+pub struct Proof {
+    log_index: u64,
+    log_entry_data: Vec<u8>,
+    receipt_index: u64,
+    receipt_data: Vec<u8>,
+    header_data: Vec<u8>,
+    proof: Vec<Vec<u8>>,
+}
+
+#[ext_contract(ext_fungible_token)]
+pub trait ExtFungibleToken {
+    #[result_serializer(borsh)]
+    fn finish_mint(
+        &self,
+        #[callback]
+        #[serializer(borsh)]
+        verification_success: bool,
+        #[serializer(borsh)] new_owner_id: AccountId,
+        #[serializer(borsh)] amount: U128,
+    ) -> Promise;
+}
 
 /// This trait provides the baseline of functions as described at:
 /// https://github.com/nearprotocol/NEPs/blob/nep-4/specs/Standards/Tokens/NonFungibleToken.md
@@ -48,34 +167,49 @@ pub type AccountIdHash = Vec<u8>;
 // Begin implementation
 #[near_bindgen]
 #[derive(BorshDeserialize, BorshSerialize)]
-pub struct NonFungibleTokenBasic {
+pub struct MintableNonFungibleToken {
     pub token_to_account: UnorderedMap<TokenId, AccountId>,
     pub account_gives_access: UnorderedMap<AccountIdHash, UnorderedSet<AccountIdHash>>, // Vec<u8> is sha256 of account, makes it safer and is how fungible token also works
-    pub owner_id: AccountId,
+
+    /// The account of the prover that we can use to prove
+    pub prover_account: AccountId,
+    /// Address of the Ethereum locker contract.
+    pub locker_address: [u8; 20],
+    /// Hashes of the events that were already used.
+    pub used_events: UnorderedSet<Vec<u8>>,
 }
 
-impl Default for NonFungibleTokenBasic {
+impl Default for MintableNonFungibleToken {
     fn default() -> Self {
         panic!("NFT should be initialized before usage")
     }
 }
 
 #[near_bindgen]
-impl NonFungibleTokenBasic {
+impl MintableNonFungibleToken {
+    /// `prover_account`: NEAR account of the Near Prover contract;
+    /// `locker_address`: Ethereum address of the locker contract, in hex.
     #[init]
-    pub fn new(owner_id: AccountId) -> Self {
-        assert!(env::is_valid_account_id(owner_id.as_bytes()), "Owner's account ID is invalid.");
+    pub fn new(prover_account: AccountId, locker_address: String) -> Self {
+        let data =
+        hex::decode(locker_address).expect("`locker_address` should be a valid hex string.");
+        assert_eq!(data.len(), 20, "`locker_address` should be 20 bytes long");
+        let mut locker_address = [0u8; 20];
+        locker_address.copy_from_slice(&data);
+
         assert!(!env::state_exists(), "Already initialized");
         Self {
             token_to_account: UnorderedMap::new(b"token-belongs-to".to_vec()),
             account_gives_access: UnorderedMap::new(b"gives-access".to_vec()),
-            owner_id,
+            prover_account,
+            locker_address,
+            used_events: UnorderedSet::new(b"u".to_vec()),
         }
     }
 }
 
 #[near_bindgen]
-impl NEP4 for NonFungibleTokenBasic {
+impl NEP4 for MintableNonFungibleToken {
     fn grant_access(&mut self, escrow_account_id: AccountId) {
         let escrow_hash = env::sha256(escrow_account_id.as_bytes());
         let predecessor = env::predecessor_account_id();
@@ -157,11 +291,10 @@ impl NEP4 for NonFungibleTokenBasic {
 
 /// Methods not in the strict scope of the NFT spec (NEP4)
 #[near_bindgen]
-impl NonFungibleTokenBasic {
+impl MintableNonFungibleToken {
     /// Creates a token for owner_id, doesn't use autoincrement, fails if id is taken
-    pub fn mint_token(&mut self, owner_id: String, token_id: TokenId) {
-        // make sure that only the owner can call this funtion
-        self.only_owner();
+    pub fn mint(&mut self, owner_id: String, token_id: TokenId) {
+
         // Since Map doesn't have `contains` we use match
         let token_check = self.token_to_account.get(&token_id);
         if token_check.is_some() {
@@ -169,11 +302,6 @@ impl NonFungibleTokenBasic {
         }
         // No token with that ID exists, mint and add token to data structures
         self.token_to_account.insert(&token_id, &owner_id);
-    }
-
-    /// helper function determining contract ownership
-    fn only_owner(&mut self) {
-        assert_eq!(env::predecessor_account_id(), self.owner_id, "Only contract owner can call this method.");
     }
 }
 
@@ -221,7 +349,7 @@ mod tests {
     fn grant_access() {
         let context = get_context(robert(), 0);
         testing_env!(context);
-        let mut contract = NonFungibleTokenBasic::new(robert());
+        let mut contract = MintableNonFungibleToken::new(robert());
         let length_before = contract.account_gives_access.len();
         assert_eq!(0, length_before, "Expected empty account access Map.");
         contract.grant_access(mike());
@@ -240,7 +368,7 @@ mod tests {
     fn revoke_access_and_panic() {
         let context = get_context(robert(), 0);
         testing_env!(context);
-        let mut contract = NonFungibleTokenBasic::new(robert());
+        let mut contract = MintableNonFungibleToken::new(robert());
         contract.revoke_access(joe());
     }
 
@@ -249,7 +377,7 @@ mod tests {
         // Joe grants access to Robert
         let mut context = get_context(joe(), 0);
         testing_env!(context);
-        let mut contract = NonFungibleTokenBasic::new(joe());
+        let mut contract = MintableNonFungibleToken::new(joe());
         contract.grant_access(robert());
 
         // does Robert have access to Joe's account? Yes.
@@ -274,7 +402,7 @@ mod tests {
     fn mint_token_get_token_owner() {
         let context = get_context(robert(), 0);
         testing_env!(context);
-        let mut contract = NonFungibleTokenBasic::new(robert());
+        let mut contract = MintableNonFungibleToken::new(robert());
         contract.mint_token(mike(), 19u64);
         let owner = contract.get_token_owner(19u64);
         assert_eq!(mike(), owner, "Unexpected token owner.");
@@ -289,7 +417,7 @@ mod tests {
         // Robert is trying to transfer it to Robert's account without having access.
         let context = get_context(robert(), 0);
         testing_env!(context);
-        let mut contract = NonFungibleTokenBasic::new(robert());
+        let mut contract = MintableNonFungibleToken::new(robert());
         let token_id = 19u64;
         contract.mint_token(mike(), token_id);
         contract.transfer_from(mike(), robert(), token_id.clone());
@@ -302,7 +430,7 @@ mod tests {
         // New owner account: joe.testnet
         let mut context = get_context(mike(), 0);
         testing_env!(context);
-        let mut contract = NonFungibleTokenBasic::new(mike());
+        let mut contract = MintableNonFungibleToken::new(mike());
         let token_id = 19u64;
         contract.mint_token(mike(), token_id);
         // Mike grants access to Robert
@@ -328,7 +456,7 @@ mod tests {
         // New owner account: joe.testnet
         let mut context = get_context(mike(), 0);
         testing_env!(context);
-        let mut contract = NonFungibleTokenBasic::new(mike());
+        let mut contract = MintableNonFungibleToken::new(mike());
         let token_id = 19u64;
         contract.mint_token(mike(), token_id);
         // Mike grants access to Robert
@@ -346,7 +474,7 @@ mod tests {
         // New owner account: joe.testnet
 
         testing_env!(get_context(robert(), 0));
-        let mut contract = NonFungibleTokenBasic::new(robert());
+        let mut contract = MintableNonFungibleToken::new(robert());
         let token_id = 19u64;
         contract.mint_token(robert(), token_id);
 
@@ -368,7 +496,7 @@ mod tests {
         // New owner account: joe.testnet
         let mut context = get_context(mike(), 0);
         testing_env!(context);
-        let mut contract = NonFungibleTokenBasic::new(mike());
+        let mut contract = MintableNonFungibleToken::new(mike());
         let token_id = 19u64;
         contract.mint_token(mike(), token_id);
         // Mike grants access to Robert
@@ -386,7 +514,7 @@ mod tests {
         // New owner account: joe.testnet
 
         testing_env!(get_context(robert(), 0));
-        let mut contract = NonFungibleTokenBasic::new(robert());
+        let mut contract = MintableNonFungibleToken::new(robert());
         let token_id = 19u64;
         contract.mint_token(robert(), token_id);
 
