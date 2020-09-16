@@ -4,11 +4,16 @@
 
 use borsh::{BorshDeserialize, BorshSerialize};
 use near_sdk::collections::{UnorderedMap, UnorderedSet};
-use near_sdk::{env, near_bindgen, AccountId, ext_contract};
+use near_sdk::{
+    env, near_bindgen, AccountId, ext_contract, Balance, Promise, PromiseOrValue, StorageUsage
+};
 use near_sdk::json_types::U128;
 
 #[global_allocator]
 static ALLOC: wee_alloc::WeeAlloc = wee_alloc::WeeAlloc::INIT;
+
+/// Price per 1 byte of storage from mainnet genesis config.
+const STORAGE_PRICE_PER_BYTE: Balance = 100000000000000000000;
 
 /// Data that was emitted by the Ethereum event.
 pub struct EthEventData {
@@ -292,16 +297,146 @@ impl NEP4 for MintableNonFungibleToken {
 /// Methods not in the strict scope of the NFT spec (NEP4)
 #[near_bindgen]
 impl MintableNonFungibleToken {
-    /// Creates a token for owner_id, doesn't use autoincrement, fails if id is taken
-    pub fn mint(&mut self, owner_id: String, token_id: TokenId) {
+    
+    // pub fn mint(&mut self, owner_id: String, token_id: TokenId) {
+
+    //     // Since Map doesn't have `contains` we use match
+    //     let token_check = self.token_to_account.get(&token_id);
+    //     if token_check.is_some() {
+    //         env::panic(b"Token ID already exists.")
+    //     }
+    //     // No token with that ID exists, mint and add token to data structures
+    //     self.token_to_account.insert(&token_id, &owner_id);
+    // }
+
+    /// Record proof to make sure it is not re-used later for minting.
+    fn record_proof(&mut self, proof: &Proof) {
+        let mut data = proof.log_index.try_to_vec().unwrap();
+        data.extend(proof.receipt_index.try_to_vec().unwrap());
+        data.extend(proof.header_data.clone());
+        let key = env::sha256(&data);
+        assert!(
+            !self.used_events.contains(&key),
+            "Event cannot be reused for minting."
+        );
+        self.used_events.insert(&key);
+    }
+
+    #[payable]
+    pub fn mint(&mut self, #[serializer(borsh)] proof: Proof) -> PromiseOrValue<()> {
+        let initial_storage = env::storage_usage();
+        self.record_proof(&proof);
+        let current_storage = env::storage_usage();
+        let attached_deposit = env::attached_deposit();
+        let required_deposit =
+            Balance::from(current_storage - initial_storage) * STORAGE_PRICE_PER_BYTE;
+        let leftover_deposit = attached_deposit - required_deposit;
+        let Proof {
+            log_index,
+            log_entry_data,
+            receipt_index,
+            receipt_data,
+            header_data,
+            proof,
+        } = proof;
+        let event = EthEventData::from_log_entry_data(&log_entry_data);
+        assert_eq!(
+            event.locker_address,
+            self.locker_address,
+            "Event's address {} does not match locker address of this token {}",
+            hex::encode(&event.locker_address),
+            hex::encode(&self.locker_address),
+        );
+        env::log(format!("{}", event).as_bytes());
+        let EthEventData {
+            recipient, token_id, ..
+        } = event;
+        
+        PromiseOrValue::Promise(
+            prover::verify_log_entry(
+                log_index,
+                log_entry_data,
+                receipt_index,
+                receipt_data,
+                header_data,
+                proof,
+                false, // Do not skip bridge call. This is only used for development and diagnostics.
+                &self.prover_account,
+                0,
+                env::prepaid_gas() / 3,
+            )
+            .then(ext_fungible_token::finish_mint(
+                recipient,
+                token_id.into(),
+                &env::current_account_id(),
+                leftover_deposit,
+                env::prepaid_gas() / 3,
+            )),
+        )
+    }
+
+    /// Finish minting once the proof was successfully validated. Can only be called by the contract
+    /// itself.
+    #[payable]
+    pub fn finish_mint(
+        &mut self,
+        #[callback]
+        #[serializer(borsh)]
+        verification_success: bool,
+        #[serializer(borsh)] new_owner_id: AccountId,
+        #[serializer(borsh)] amount: U128,
+    ) {
+        let initial_storage = env::storage_usage();
+        assert_eq!(
+            env::predecessor_account_id(),
+            env::current_account_id(),
+            "Finish transfer is only allowed to be called by the contract itself"
+        );
+        assert!(verification_success, "Failed to verify the proof");
 
         // Since Map doesn't have `contains` we use match
+        let token_id_u128: Balance = amount.into();
+        let token_id: TokenId = token_id_u128 as u64; // TODO; look into why TokenId is u64 rather than u128 in the first place
         let token_check = self.token_to_account.get(&token_id);
         if token_check.is_some() {
             env::panic(b"Token ID already exists.")
         }
         // No token with that ID exists, mint and add token to data structures
-        self.token_to_account.insert(&token_id, &owner_id);
+        self.token_to_account.insert(&token_id, &new_owner_id);
+
+        self.refund_storage(initial_storage);
+    }
+}
+
+impl MintableNonFungibleToken {
+    fn refund_storage(&self, initial_storage: StorageUsage) {
+        let current_storage = env::storage_usage();
+        let attached_deposit = env::attached_deposit();
+        let refund_amount = if current_storage > initial_storage {
+            let required_deposit =
+                Balance::from(current_storage - initial_storage) * STORAGE_PRICE_PER_BYTE;
+            assert!(
+                required_deposit <= attached_deposit,
+                "The required attached deposit is {}, but the given attached deposit is is {}",
+                required_deposit,
+                attached_deposit,
+            );
+            attached_deposit - required_deposit
+        } else {
+            attached_deposit
+                + Balance::from(initial_storage - current_storage) * STORAGE_PRICE_PER_BYTE
+        };
+        if refund_amount > 0 {
+            env::log(
+                format!(
+                    "Refunding {} tokens for storage to {}",
+                    refund_amount,
+                    env::signer_account_id()
+                )
+                .as_bytes(),
+            );
+            Promise::new(env::signer_account_id()).transfer(refund_amount);
+        }
     }
 }
 
